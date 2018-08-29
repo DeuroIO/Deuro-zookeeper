@@ -18,11 +18,11 @@
 
 AC_PREREQ(2.59)
 
-AC_INIT([zooqueue], [3.2.0])
+AC_INIT([zoolock], [3.2.0])
 
-AC_CONFIG_SRCDIR([include/zoo_queue.h])
+AC_CONFIG_SRCDIR([include/zoo_lock.h])
 
-PACKAGE=zooqueue
+PACKAGE=zoolock
 VERSION=1.0
 
 AC_SUBST(PACKAGE)
@@ -45,11 +45,11 @@ DX_RTF_FEATURE(OFF)
 DX_XML_FEATURE(OFF)
 DX_PDF_FEATURE(OFF)
 DX_PS_FEATURE(OFF)
-DX_INIT_DOXYGEN([zookeeper-queues],[c-doc.Doxyfile],[docs])
+DX_INIT_DOXYGEN([zookeeper-locks],[c-doc.Doxyfile],[docs])
 
   
-ZOOKEEPER_PATH=${BUILD_PATH}/../../../../../src/c
-ZOOKEEPER_LD=-L${BUILD_PATH}/../../../../../src/c\ -lzookeeper_mt
+ZOOKEEPER_PATH=${BUILD_PATH}/../../../../zookeeper-client/zookeeper-client-c
+ZOOKEEPER_LD=-L${BUILD_PATH}/../../../../zookeeper-client/zookeeper-client-c\ -lzookeeper_mt
 
 AC_SUBST(ZOOKEEPER_PATH)
 AC_SUBST(ZOOKEEPER_LD)
