@@ -66,6 +66,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * This class maintains the tree data structure. It doesn't have any networking
@@ -89,6 +90,9 @@ public class DataTree {
     private final WatchManager dataWatches = new WatchManager();
 
     private final WatchManager childWatches = new WatchManager();
+
+    /** cached total size of paths and data for all DataNodes */
+    private final AtomicLong nodeDataSize = new AtomicLong(0);
 
     /** the root of zookeeper tree */
     private static final String rootZookeeper = "/";
@@ -199,11 +203,22 @@ public class DataTree {
         for (Map.Entry<String, DataNode> entry : nodes.entrySet()) {
             DataNode value = entry.getValue();
             synchronized (value) {
-                result += entry.getKey().length();
-                result += value.getApproximateDataSize();
+                result += getNodeSize(entry.getKey(), value.data);
             }
         }
         return result;
+    }
+
+    /**
+     * Get the size of the node based on path and data length.
+     */
+    private static long getNodeSize(String path, byte[] data) {
+        return (path == null ? 0 : path.length())
+                + (data == null ? 0 : data.length);
+    }
+
+    public long cachedApproximateDataSize() {
+        return nodeDataSize.get();
     }
 
     /**
@@ -236,6 +251,8 @@ public class DataTree {
         nodes.put(quotaZookeeper, quotaDataNode);
 
         addConfigNode();
+
+        nodeDataSize.set(approximateDataSize());
     }
 
     /**
@@ -468,6 +485,7 @@ public class DataTree {
             Long longval = aclCache.convertAcls(acl);
             DataNode child = new DataNode(data, longval, stat);
             parent.addChild(childName);
+            nodeDataSize.addAndGet(getNodeSize(path, child.data));
             nodes.put(path, child);
             EphemeralType ephemeralType = EphemeralType.get(ephemeralOwner);
             if (ephemeralType == EphemeralType.CONTAINER) {
@@ -527,14 +545,10 @@ public class DataTree {
         int lastSlash = path.lastIndexOf('/');
         String parentName = path.substring(0, lastSlash);
         String childName = path.substring(lastSlash + 1);
-        DataNode node = nodes.get(path);
-        if (node == null) {
-            throw new KeeperException.NoNodeException();
-        }
-        nodes.remove(path);
-        synchronized (node) {
-            aclCache.removeUsage(node.acl);
-        }
+
+        // The child might already be deleted during taking fuzzy snapshot,
+        // but we still need to update the pzxid here before throw exception
+        // for no such child
         DataNode parent = nodes.get(parentName);
         if (parent == null) {
             throw new KeeperException.NoNodeException();
@@ -542,6 +556,22 @@ public class DataTree {
         synchronized (parent) {
             parent.removeChild(childName);
             parent.stat.setPzxid(zxid);
+        }
+
+        DataNode node = nodes.get(path);
+        if (node == null) {
+            throw new KeeperException.NoNodeException();
+        }
+        nodes.remove(path);
+        synchronized (node) {
+            aclCache.removeUsage(node.acl);
+            nodeDataSize.addAndGet(-getNodeSize(path, node.data));
+        }
+
+        // Synchronized to sync the containers and ttls change, probably
+        // only need to sync on containers and ttls, will update it in a
+        // separate patch.
+        synchronized (parent) {
             long eowner = node.stat.getEphemeralOwner();
             EphemeralType ephemeralType = EphemeralType.get(eowner);
             if (ephemeralType == EphemeralType.CONTAINER) {
@@ -557,6 +587,7 @@ public class DataTree {
                 }
             }
         }
+
         if (parentName.startsWith(procZookeeper) && Quotas.limitNode.equals(childName)) {
             // delete the node in the trie.
             // we need to update the trie as well
@@ -609,6 +640,7 @@ public class DataTree {
           this.updateBytes(lastPrefix, (data == null ? 0 : data.length)
               - (lastdata == null ? 0 : lastdata.length));
         }
+        nodeDataSize.addAndGet(getNodeSize(path, data) - getNodeSize(path, lastdata));
         dataWatches.triggerWatch(path, EventType.NodeDataChanged);
         return s;
     }
@@ -768,7 +800,11 @@ public class DataTree {
 
     public volatile long lastProcessedZxid = 0;
 
-    public ProcessTxnResult processTxn(TxnHeader header, Record txn)
+    public ProcessTxnResult processTxn(TxnHeader header, Record txn) {
+        return this.processTxn(header, txn, false);
+    }
+
+    public ProcessTxnResult processTxn(TxnHeader header, Record txn, boolean isSubTxn)
     {
         ProcessTxnResult rc = new ProcessTxnResult();
 
@@ -923,7 +959,7 @@ public class DataTree {
                         TxnHeader subHdr = new TxnHeader(header.getClientId(), header.getCxid(),
                                                          header.getZxid(), header.getTime(),
                                                          subtxn.getType());
-                        ProcessTxnResult subRc = processTxn(subHdr, record);
+                        ProcessTxnResult subRc = processTxn(subHdr, record, true);
                         rc.multiResult.add(subRc);
                         if (subRc.err != 0 && rc.err == 0) {
                             rc.err = subRc.err ;
@@ -941,22 +977,41 @@ public class DataTree {
                 LOG.debug("Failed: " + header + ":" + txn, e);
             }
         }
+
+
         /*
-         * A snapshot might be in progress while we are modifying the data
-         * tree. If we set lastProcessedZxid prior to making corresponding
-         * change to the tree, then the zxid associated with the snapshot
-         * file will be ahead of its contents. Thus, while restoring from
-         * the snapshot, the restore method will not apply the transaction
-         * for zxid associated with the snapshot file, since the restore
-         * method assumes that transaction to be present in the snapshot.
+         * Things we can only update after the whole txn is applied to data
+         * tree.
          *
-         * To avoid this, we first apply the transaction and then modify
-         * lastProcessedZxid.  During restore, we correctly handle the
-         * case where the snapshot contains data ahead of the zxid associated
-         * with the file.
+         * If we update the lastProcessedZxid with the first sub txn in multi
+         * and there is a snapshot in progress, it's possible that the zxid
+         * associated with the snapshot only include partial of the multi op.
+         *
+         * When loading snapshot, it will only load the txns after the zxid
+         * associated with snapshot file, which could cause data inconsistency
+         * due to missing sub txns.
+         *
+         * To avoid this, we only update the lastProcessedZxid when the whole
+         * multi-op txn is applied to DataTree.
          */
-        if (rc.zxid > lastProcessedZxid) {
-            lastProcessedZxid = rc.zxid;
+        if (!isSubTxn) {
+            /*
+             * A snapshot might be in progress while we are modifying the data
+             * tree. If we set lastProcessedZxid prior to making corresponding
+             * change to the tree, then the zxid associated with the snapshot
+             * file will be ahead of its contents. Thus, while restoring from
+             * the snapshot, the restore method will not apply the transaction
+             * for zxid associated with the snapshot file, since the restore
+             * method assumes that transaction to be present in the snapshot.
+             *
+             * To avoid this, we first apply the transaction and then modify
+             * lastProcessedZxid.  During restore, we correctly handle the
+             * case where the snapshot contains data ahead of the zxid associated
+             * with the file.
+             */
+            if (rc.zxid > lastProcessedZxid) {
+                lastProcessedZxid = rc.zxid;
+            }
         }
 
         /*
@@ -1155,8 +1210,7 @@ public class DataTree {
             Set<String> childs = node.getChildren();
             children = childs.toArray(new String[childs.size()]);
         }
-        oa.writeString(pathString, "path");
-        oa.writeRecord(nodeCopy, "node");
+        serializeNodeData(oa, pathString, nodeCopy);
         path.append('/');
         int off = path.length();
         for (String child : children) {
@@ -1167,6 +1221,12 @@ public class DataTree {
             path.append(child);
             serializeNode(oa, path);
         }
+    }
+
+    // visiable for test
+    public void serializeNodeData(OutputArchive oa, String path, DataNode node) throws IOException {
+        oa.writeString(path, "path");
+        oa.writeRecord(node, "node");
     }
 
     public void serialize(OutputArchive oa, String tag) throws IOException {
@@ -1183,6 +1243,7 @@ public class DataTree {
         aclCache.deserialize(ia);
         nodes.clear();
         pTrie.clear();
+        nodeDataSize.set(0);
         String path = ia.readString("path");
         while (!"/".equals(path)) {
             DataNode node = new DataNode();
@@ -1220,6 +1281,9 @@ public class DataTree {
             path = ia.readString("path");
         }
         nodes.put("/", root);
+
+        nodeDataSize.set(approximateDataSize());
+
         // we are done with deserializing the
         // the datatree
         // update the quotas - create path trie
